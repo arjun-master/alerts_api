@@ -19,9 +19,12 @@ from functools import partial
 # Create logs directory in the current working directory
 log_dir = os.path.join(os.getcwd(), 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, 'webhook.log')
-perf_log_file = os.path.join(log_dir, 'performance.log')
-token_file = os.path.join(log_dir, 'fyers_token.json')
+
+# Get today's date for log files
+today_date = datetime.now().strftime('%Y-%m-%d')
+log_file = os.path.join(log_dir, f'webhook_{today_date}.log')
+perf_log_file = os.path.join(log_dir, f'performance_{today_date}.log')
+token_file = os.path.join(log_dir, 'fyers_token.json')  # Keep token file name constant
 
 # Configure logging with rotation and reduced verbosity
 logging.basicConfig(
@@ -30,7 +33,7 @@ logging.basicConfig(
     handlers=[
         RotatingFileHandler(
             log_file,
-            maxBytes=5*1024*1024,
+            maxBytes=5*1024*1024,  # 5MB
             backupCount=3,
             encoding='utf-8'
         )
@@ -43,7 +46,7 @@ perf_logger = logging.getLogger('performance')
 perf_logger.setLevel(logging.INFO)
 perf_handler = RotatingFileHandler(
     perf_log_file,
-    maxBytes=5*1024*1024,
+    maxBytes=5*1024*1024,  # 5MB
     backupCount=3,
     encoding='utf-8'
 )
@@ -81,7 +84,7 @@ def load_cached_token():
             with open(token_file, 'r') as f:
                 token_data = json.load(f)
                 token_date = datetime.fromisoformat(token_data['timestamp']).date()
-                today = datetime.now().date()
+                today = validate_date(datetime.now().date())
                 if token_date == today:  # Only use token if it's from today
                     logger.info(f"Using cached token from {token_date}")
                     return token_data['token']
@@ -99,9 +102,15 @@ def save_token(token):
         # Ensure logs directory exists
         os.makedirs(os.path.dirname(token_file), exist_ok=True)
         
+        # Get current time and validate it's not in the future
+        current_time = datetime.now()
+        current_date = validate_date(current_time.date())
+        if current_time.date() != current_date:
+            current_time = datetime.combine(current_date, current_time.time())
+        
         token_data = {
             'token': token,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': current_time.isoformat()
         }
         
         # Write to a temporary file first
@@ -112,7 +121,7 @@ def save_token(token):
         # Atomic rename to ensure file integrity
         os.replace(temp_file, token_file)
         
-        logger.info(f"Successfully saved new token for {datetime.now().date()}")
+        logger.info(f"Successfully saved new token for {current_date}")
     except Exception as e:
         logger.error(f"Error saving token: {str(e)}")
         # Clean up temp file if it exists
@@ -295,95 +304,73 @@ def get_fyers_access_token():
         raise
 
 def fetch_stock_data(symbols_batch, headers, today, use_historical):
-    """Fetch data for a batch of stocks"""
+    """Fetch data for a batch of stocks using Fyers SDK"""
     stock_data = {}
     try:
+        # Initialize Fyers SDK
+        from fyers_apiv3 import fyersModel
+        fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=headers["Authorization"].split(" ")[1])
+        
         # Get today's data for all stocks in batch
         if use_historical:
-            # Get historical data for all stocks in one call
+            # Get historical data using SDK
             data = {
-                "symbols": symbols_batch,
+                "symbol": ",".join(symbols_batch),
                 "resolution": "D",
-                "date_format": "1",
+                "date_format": 1,
                 "range_from": today.strftime("%Y-%m-%d"),
                 "range_to": today.strftime("%Y-%m-%d"),
                 "cont_flag": "1"
             }
-            response = session.post(
-                "https://api.fyers.in/data/history",
-                headers=headers,
-                json=data,
-                timeout=5
-            )
+            logger.info(f"Fetching historical data: {json.dumps(data, indent=2)}")
+            resp = fyers.history(data)
             
-            if response.status_code == 200:
-                try:
-                    resp = response.json()
-                    if resp.get("s") == "ok" and resp.get("candles"):
-                        for symbol, candle in zip(symbols_batch, resp["candles"]):
-                            stock_data[symbol] = {"prev_day": candle[4] if candle else None}
-                except Exception:
-                    for symbol in symbols_batch:
-                        stock_data[symbol] = {"prev_day": None}
+            if resp.get("s") == "ok" and resp.get("candles"):
+                for symbol, candle in zip(symbols_batch, resp["candles"]):
+                    stock_data[symbol] = {"prev_day": candle[4] if candle else None}
             else:
                 for symbol in symbols_batch:
                     stock_data[symbol] = {"prev_day": None}
         else:
-            # Get live quotes for all stocks in one call
+            # Get live quotes using SDK
             symbols_str = ",".join(symbols_batch)
-            quote_url = f"https://api.fyers.in/data/quotes?symbols={symbols_str}"
-            response = session.get(quote_url, headers=headers, timeout=5)
+            logger.info(f"Fetching live quotes for: {symbols_str}")
+            quotes = fyers.quotes({"symbols": symbols_str})
             
-            if response.status_code == 200:
-                try:
-                    quote_data = response.json()
-                    if quote_data.get("d"):
-                        for quote in quote_data["d"]:
-                            symbol = quote.get("n")
-                            if symbol in symbols_batch:
-                                stock_data[symbol] = {"prev_day": quote.get("lp")}
-                except Exception:
-                    for symbol in symbols_batch:
-                        stock_data[symbol] = {"prev_day": None}
+            if quotes.get("s") == "ok" and quotes.get("d"):
+                for quote in quotes["d"]:
+                    symbol = quote.get("n")
+                    if symbol in symbols_batch:
+                        stock_data[symbol] = {"prev_day": quote.get("lp")}
             else:
                 for symbol in symbols_batch:
                     stock_data[symbol] = {"prev_day": None}
 
-        # Get historical data for 3 and 7 days back in one call
+        # Get historical data for 3 and 7 days back using SDK
         for days_back, label in zip([3, 7], ["three_days_back", "seven_days_back"]):
             date = today - timedelta(days=days_back)
             data = {
-                "symbols": symbols_batch,
+                "symbol": ",".join(symbols_batch),
                 "resolution": "D",
-                "date_format": "1",
+                "date_format": 1,
                 "range_from": date.strftime("%Y-%m-%d"),
                 "range_to": date.strftime("%Y-%m-%d"),
                 "cont_flag": "1"
             }
             try:
-                response = session.post(
-                    "https://api.fyers.in/data/history",
-                    headers=headers,
-                    json=data,
-                    timeout=5
-                )
+                logger.info(f"Fetching {label} data: {json.dumps(data, indent=2)}")
+                resp = fyers.history(data)
                 
-                if response.status_code == 200:
-                    try:
-                        resp = response.json()
-                        if resp.get("s") == "ok" and resp.get("candles"):
-                            for symbol, candle in zip(symbols_batch, resp["candles"]):
-                                if symbol in stock_data:
-                                    stock_data[symbol][label] = candle[4] if candle else None
-                    except Exception:
-                        for symbol in symbols_batch:
-                            if symbol in stock_data:
-                                stock_data[symbol][label] = None
+                if resp.get("s") == "ok" and resp.get("candles"):
+                    for symbol, candle in zip(symbols_batch, resp["candles"]):
+                        if symbol in stock_data:
+                            stock_data[symbol][label] = candle[4] if candle else None
                 else:
                     for symbol in symbols_batch:
                         if symbol in stock_data:
                             stock_data[symbol][label] = None
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error fetching {label} data: {str(e)}")
                 for symbol in symbols_batch:
                     if symbol in stock_data:
                         stock_data[symbol][label] = None
@@ -399,88 +386,154 @@ def fetch_stock_data(symbols_batch, headers, today, use_historical):
     
     return stock_data
 
+def get_previous_working_day(date):
+    """Get the previous working day, skipping weekends"""
+    # Start with the previous day
+    prev_date = date - timedelta(days=1)
+    
+    # Keep going back until we find a weekday
+    while prev_date.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        prev_date = prev_date - timedelta(days=1)
+    
+    # Ensure we don't return a future date
+    return validate_date(prev_date)
+
+def get_exchange_symbol(fyers, symbol):
+    """Check symbol availability in BSE first, then NSE if not found"""
+    # Remove any existing prefixes and suffixes
+    base_symbol = symbol.replace("NSE:", "").replace("BSE:", "").replace("-EQ", "")
+    base_symbol = base_symbol.replace(".NS", "").replace(".BO", "").upper()
+    
+    # First try BSE since most stocks are available there
+    bse_symbol = f"BSE:{base_symbol}-EQ"
+    try:
+        quotes = fyers.quotes({"symbols": bse_symbol})
+        if quotes.get("s") == "ok" and quotes.get("d"):
+            for quote in quotes["d"]:
+                if quote.get("s") == "ok" and quote.get("v", {}).get("lp") is not None:
+                    logger.info(f"Symbol {base_symbol} found in BSE")
+                    return bse_symbol
+    except Exception as e:
+        logger.info(f"Symbol {base_symbol} not found in BSE: {str(e)}")
+    
+    # If not in BSE, try NSE
+    nse_symbol = f"NSE:{base_symbol}-EQ"
+    try:
+        quotes = fyers.quotes({"symbols": nse_symbol})
+        if quotes.get("s") == "ok" and quotes.get("d"):
+            for quote in quotes["d"]:
+                if quote.get("s") == "ok" and quote.get("v", {}).get("lp") is not None:
+                    logger.info(f"Symbol {base_symbol} found in NSE")
+                    return nse_symbol
+    except Exception as e:
+        logger.info(f"Symbol {base_symbol} not found in NSE: {str(e)}")
+    
+    # If not found in either exchange, default to NSE format
+    logger.warning(f"Symbol {base_symbol} not found in either BSE or NSE, defaulting to NSE format")
+    return f"NSE:{base_symbol}-EQ"
+
+def validate_date(date):
+    """Validate that a date is not in the future and return the most recent valid date"""
+    today = datetime.now().date()
+    if date > today:
+        logger.warning(f"Date {date} is in the future, using today's date {today} instead")
+        return today
+    return date
+
+def date_to_unix_timestamp(date, end_of_day=False):
+    """Convert datetime.date to Unix timestamp (seconds since epoch)"""
+    if end_of_day:
+        time_obj = datetime.max.time()  # 23:59:59.999999
+    else:
+        time_obj = datetime.min.time()  # 00:00:00
+    return int(datetime.combine(date, time_obj).timestamp())
+
 @measure_performance("get_historical_closes")
 def get_historical_closes(access_token, symbols):
-    """Get historical close prices for given symbols"""
+    """Get historical close prices for given symbols using Fyers SDK"""
     closes = {}
-    today = datetime.now().date()
-    headers = {"Authorization": f"Bearer {access_token}"}
+    today = validate_date(datetime.now().date())
     
-    # Get current time in IST (server is set to Asia/Kolkata)
-    current_time = datetime.now().time()
-    
-    # Market hours in IST (9:00 AM to 3:30 PM)
-    market_start = datetime.strptime("09:00:00", "%H:%M:%S").time()
-    market_end = datetime.strptime("15:30:00", "%H:%M:%S").time()
-    
-    # Use live data during market hours, historical data otherwise
-    use_historical = not (market_start <= current_time <= market_end)
-    logger.info(f"Current time (IST): {current_time}, Using {'historical' if use_historical else 'live'} data")
-
-    # Get all required dates
-    dates = [
-        today,
-        today - timedelta(days=3),
-        today - timedelta(days=7)
-    ]
-    
-    # Process each symbol individually
-    for symbol in symbols:
-        closes[symbol] = {
-            "prev_day": None,
-            "three_days_back": None,
-            "seven_days_back": None
-        }
+    try:
+        # Initialize Fyers SDK
+        from fyers_apiv3 import fyersModel
+        fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=access_token)
         
-        try:
-            # Fetch historical data for this symbol
-            data = {
-                "symbol": symbol,  # Send single symbol instead of array
-                "resolution": "D",
-                "date_format": "1",
-                "range_from": min(dates).strftime("%Y-%m-%d"),
-                "range_to": max(dates).strftime("%Y-%m-%d"),
-                "cont_flag": "1"
-            }
-            
-            logger.info(f"Fetching {'historical' if use_historical else 'live'} data for {symbol}")
-            logger.info(f"Request data: {json.dumps(data, indent=2)}")
-            
-            response = session.post(
-                "https://api.fyers.in/data/history",
-                headers=headers,
-                json=data,
-                timeout=10
-            )
-            
-            logger.info(f"Data response status for {symbol}: {response.status_code}")
-            logger.info(f"Data response for {symbol}: {response.text}")
-            
-            if response.status_code == 200:
-                try:
-                    resp = response.json()
-                    if resp.get("s") == "ok" and resp.get("candles"):
-                        logger.info(f"Successfully received {len(resp['candles'])} candles for {symbol}")
+        # Process each symbol individually for historical data
+        for symbol in symbols:
+            try:
+                # Get exchange-specific symbol
+                exchange_symbol = get_exchange_symbol(fyers, symbol)
+                
+                # Initialize closes dict for this symbol
+                closes[symbol] = {
+                    "current_data": None,
+                    "three_days_back": {"close": None, "volume": None},
+                    "seven_days_back": {"close": None, "volume": None}
+                }
+                
+                # Get live quotes
+                logger.info(f"Fetching live quotes for: {exchange_symbol}")
+                quotes = fyers.quotes({"symbols": exchange_symbol})
+                logger.info(f"Quotes response: {json.dumps(quotes, indent=2)}")
+                
+                # Process live quotes
+                if quotes.get("s") == "ok" and quotes.get("d"):
+                    for quote in quotes["d"]:
+                        if quote.get("s") == "ok" and quote.get("v"):
+                            closes[symbol]["current_data"] = quote.get("v", {})
+                            logger.info(f"Live quote for {symbol}: {json.dumps(quote.get('v', {}), indent=2)}")
+                
+                # Get historical data for 3 and 7 days back
+                for days_back, label in zip([3, 7], ["three_days_back", "seven_days_back"]):
+                    # Start from today and move back until we find a valid trading day
+                    target_date = today
+                    valid_days_found = 0
+                    
+                    while valid_days_found < days_back and target_date > today - timedelta(days=30):  # Limit search to last 30 days
+                        target_date = get_previous_working_day(target_date)
+                        if target_date.weekday() < 5:  # If it's a weekday
+                            valid_days_found += 1
+                        target_date = target_date - timedelta(days=1)
+                    
+                    # Move forward one day since the loop overshoots by one
+                    target_date = target_date + timedelta(days=1)
+                    
+                    # Convert dates to Unix timestamps
+                    range_from = date_to_unix_timestamp(target_date)  # Start of day
+                    range_to = date_to_unix_timestamp(target_date, end_of_day=True)  # End of day
+                    
+                    hist_data = {
+                        "symbol": exchange_symbol,  # Single symbol
+                        "resolution": "D",  # Daily resolution
+                        "date_format": "0",  # Use Unix timestamp format
+                        "range_from": str(range_from),
+                        "range_to": str(range_to),
+                        "cont_flag": "1"
+                    }
+                    
+                    try:
+                        logger.info(f"Fetching {label} data for {exchange_symbol}: {json.dumps(hist_data, indent=2)}")
+                        hist_resp = fyers.history(hist_data)
+                        logger.info(f"Historical response for {exchange_symbol}: {json.dumps(hist_resp, indent=2)}")
                         
-                        # Process candles for this symbol
-                        for candle in resp["candles"]:
-                            candle_date = datetime.fromtimestamp(candle[1]).date()
-                            if candle_date == today:
-                                closes[symbol]["prev_day"] = candle[4]
-                            elif candle_date == today - timedelta(days=3):
-                                closes[symbol]["three_days_back"] = candle[4]
-                            elif candle_date == today - timedelta(days=7):
-                                closes[symbol]["seven_days_back"] = candle[4]
-                        
-                        logger.info(f"Processed data for {symbol}: {json.dumps(closes[symbol], indent=2)}")
-                    else:
-                        logger.warning(f"Invalid response format or no candles for {symbol}: {resp}")
-                except Exception as e:
-                    logger.error(f"Error processing data for {symbol}: {str(e)}")
-            else:
-                logger.error(f"Failed to fetch data for {symbol}: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error fetching data for {symbol}: {str(e)}")
+                        if hist_resp.get("s") == "ok" and hist_resp.get("candles"):
+                            # candle format: [timestamp, open, high, low, close, volume]
+                            candle = hist_resp["candles"][0] if hist_resp["candles"] else None
+                            if candle and len(candle) >= 6:
+                                closes[symbol][label] = {
+                                    "close": candle[4],  # Close price is 5th field
+                                    "volume": candle[5]  # Volume is 6th field
+                                }
+                                logger.info(f"Historical {label} for {symbol}: close={closes[symbol][label]['close']}, volume={closes[symbol][label]['volume']}")
+                    except Exception as e:
+                        logger.error(f"Error fetching {label} data for {symbol}: {str(e)}")
+            
+            except Exception as e:
+                logger.error(f"Error processing symbol {symbol}: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Error initializing Fyers SDK: {str(e)}")
     
     # Force garbage collection after processing
     gc.collect()
@@ -490,24 +543,148 @@ def get_historical_closes(access_token, symbols):
 def escape_markdown_v2(text):
     """Escape special characters for Telegram MarkdownV2"""
     special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    escaped_text = str(text)
     for char in special_chars:
-        text = str(text).replace(char, f'\\{char}')
-    return text
+        escaped_text = escaped_text.replace(char, f'\\{char}')
+    return escaped_text
+
+def format_volume(volume):
+    """Format volume in K (thousands), L (lakhs), or Cr (crores) with 2 decimal places"""
+    try:
+        volume = float(volume)
+        if volume >= 10000000:  # 1 Crore = 100L = 10M
+            return f"{volume/10000000:.2f}Cr"
+        elif volume >= 100000:  # 1 Lakh = 100K
+            return f"{volume/100000:.2f}L"
+        elif volume >= 1000:    # 1K = 1000
+            return f"{volume/1000:.2f}K"
+        else:
+            return f"{volume:.0f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+def calculate_percent_change(current, previous):
+    """Calculate percentage change between two values"""
+    try:
+        current = float(current)
+        previous = float(previous)
+        if previous != 0:
+            change = ((current - previous) / previous) * 100
+            return f"{change:+.2f}%"
+    except (TypeError, ValueError):
+        pass
+    return "N/A"
+
+def calculate_volume_change(current_vol, previous_vol):
+    """Calculate volume change in X format"""
+    try:
+        current_vol = float(current_vol)
+        previous_vol = float(previous_vol)
+        if previous_vol > 0:
+            ratio = current_vol / previous_vol
+            if ratio >= 1:
+                return f"+{ratio:.1f}x"
+            else:
+                return f"{ratio:.1f}x"
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 def format_message(data, closes):
     """Format message for Telegram"""
-    msg = f"*{escape_markdown_v2(data.get('alert_name', 'N/A'))}*\n"
-    msg += f"Scan: {escape_markdown_v2(data.get('scan_name', 'Unknown Scan'))}\n"
-    msg += f"Stocks: *{escape_markdown_v2(data.get('stocks', 'No stocks'))}*\n"
-    msg += f"Prices: {escape_markdown_v2(data.get('trigger_prices', 'N/A'))}\n"
-    msg += f"Triggered At: {escape_markdown_v2(data.get('triggered_at', 'N/A'))}\n\n"
-    msg += "*Historical Close Prices:*\n\n"
+    # Header section with minimal info
+    msg = f"🚨 *{escape_markdown_v2(data.get('alert_name', 'N/A'))}*\n"
+    msg += f"⌚️ {escape_markdown_v2(data.get('triggered_at', 'N/A'))}\n\n"
     
-    for symbol, hist in closes.items():
-        msg += f"*{escape_markdown_v2(symbol)}*\n"
-        msg += f"Prev Day Close: {escape_markdown_v2(hist['prev_day'])}\n"
-        msg += f"3 Days Back Close: {escape_markdown_v2(hist['three_days_back'])}\n"
-        msg += f"7 Days Back Close: {escape_markdown_v2(hist['seven_days_back'])}\n\n"
+    for symbol, data in closes.items():
+        # Extract base symbol without exchange prefix
+        base_symbol = symbol.replace('NSE:', '').replace('BSE:', '').replace('-EQ', '')
+        
+        current_data = data.get("current_data", {})
+        if current_data and isinstance(current_data, dict) and 'lp' in current_data:
+            current = current_data
+            three_days = data.get('three_days_back', {})
+            seven_days = data.get('seven_days_back', {})
+            
+            # Get all required values
+            ltp = str(current.get('lp', 'N/A'))
+            change = str(current.get('ch', 'N/A'))
+            change_percent = str(current.get('chp', 'N/A'))
+            
+            # Get volumes and calculate volume changes
+            current_volume = current.get('volume', 0)
+            three_day_volume = three_days.get('volume', 0)
+            seven_day_volume = seven_days.get('volume', 0)
+            
+            # Calculate volume changes
+            three_day_vol_change = calculate_volume_change(current_volume, three_day_volume)
+            seven_day_vol_change = calculate_volume_change(current_volume, seven_day_volume)
+            
+            # Format volumes with their respective scales
+            current_vol_formatted = format_volume(current_volume)
+            three_day_vol_formatted = format_volume(three_day_volume)
+            seven_day_vol_formatted = format_volume(seven_day_volume)
+            
+            # Calculate historical changes
+            current_price = current.get('lp')
+            three_day_price = three_days.get('close')
+            seven_day_price = seven_days.get('close')
+            three_day_change = calculate_percent_change(current_price, three_day_price)
+            seven_day_change = calculate_percent_change(current_price, seven_day_price)
+            
+            # Format prices with 2 decimal places
+            try:
+                three_day_price_fmt = f"{float(three_day_price):.2f}"
+            except (TypeError, ValueError):
+                three_day_price_fmt = "N/A"
+                
+            try:
+                seven_day_price_fmt = f"{float(seven_day_price):.2f}"
+            except (TypeError, ValueError):
+                seven_day_price_fmt = "N/A"
+            
+            # Add arrow and color indicator based on price change
+            try:
+                change_pct_float = float(change_percent)
+                if float(change) > 0:
+                    arrow = "🟢"
+                    trend = "↗️"
+                    # Add upper arrows if change is greater than 3%
+                    if change_pct_float > 3:
+                        trend = "⬆️⬆️"
+                elif float(change) < 0:
+                    arrow = "🔴"
+                    trend = "↘️"
+                else:
+                    arrow = "⚪️"
+                    trend = "➡️"
+            except (ValueError, TypeError):
+                arrow = "⚪️"
+                trend = "➡️"
+            
+            # Format historical changes with arrows
+            try:
+                three_day_arrow = "↗️" if float(three_day_change.rstrip('%')) > 0 else "↘️" if float(three_day_change.rstrip('%')) < 0 else "➡️"
+                seven_day_arrow = "↗️" if float(seven_day_change.rstrip('%')) > 0 else "↘️" if float(seven_day_change.rstrip('%')) < 0 else "➡️"
+            except (ValueError, TypeError):
+                three_day_arrow = "➡️"
+                seven_day_arrow = "➡️"
+            
+            # Format volume changes with emojis
+            three_day_vol_emoji = "📈" if three_day_vol_change.startswith('+') else "📉" if three_day_vol_change else "➡️"
+            seven_day_vol_emoji = "📈" if seven_day_vol_change.startswith('+') else "📉" if seven_day_vol_change else "➡️"
+            
+            # Format the message in a compact way
+            msg += f"{arrow} *{escape_markdown_v2(base_symbol)}*\n"
+            msg += f"💵 {escape_markdown_v2(ltp)} {trend} {escape_markdown_v2(change_percent)}% • 📊 Vol: {escape_markdown_v2(current_vol_formatted)}\n"
+            
+            # Historical data in compact format with prices
+            msg += f"📈 3D: {escape_markdown_v2(three_day_price_fmt)} {three_day_arrow}{escape_markdown_v2(three_day_change)} \\[📊 {escape_markdown_v2(three_day_vol_formatted)} {three_day_vol_emoji} {escape_markdown_v2(three_day_vol_change)}\\]\n"
+            msg += f"📉 7D: {escape_markdown_v2(seven_day_price_fmt)} {seven_day_arrow}{escape_markdown_v2(seven_day_change)} \\[📊 {escape_markdown_v2(seven_day_vol_formatted)} {seven_day_vol_emoji} {escape_markdown_v2(seven_day_vol_change)}\\]\n"
+            msg += "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+        else:
+            msg += f"⚠️ *{escape_markdown_v2(base_symbol)}* • No Data Available\n"
+            msg += "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
     
     return msg
 
@@ -540,11 +717,11 @@ def webhook():
         stocks = [s.strip() for s in data.get("stocks", "").split(",") if s.strip()]
         formatted_stocks = []
         for stock in stocks:
-            if not stock.startswith("NSE:"):
-                stock = f"NSE:{stock}"
-            if not stock.endswith("-EQ"):
-                stock = f"{stock}-EQ"
-            formatted_stocks.append(stock)
+            # Clean the symbol and add NSE prefix by default
+            stock = stock.replace("NSE:", "").replace("BSE:", "").replace("-EQ", "")
+            stock = stock.replace(".NS", "").replace(".BO", "").upper()
+            formatted_stock = f"NSE:{stock}-EQ"
+            formatted_stocks.append(formatted_stock)
 
         # Get Fyers access token and historical data
         access_token = get_fyers_access_token()
