@@ -4,6 +4,16 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        default: 'ap-south-1'
+      deploy_to_ec2:
+        description: 'Deploy to EC2'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   deploy:
@@ -23,18 +33,25 @@ jobs:
         pip install -r requirements.txt
         
     - name: Configure AWS credentials
+      if: ${{ github.event.inputs.deploy_to_ec2 == 'true' }}
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ github.event.inputs.aws_region || 'ap-south-1' }}
         
     - name: Deploy to EC2
+      if: ${{ github.event.inputs.deploy_to_ec2 == 'true' }}
       env:
         PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
         HOST: ${{ secrets.EC2_HOST }}
         USERNAME: ${{ secrets.EC2_USERNAME }}
       run: |
+        if [ -z "$PRIVATE_KEY" ] || [ -z "$HOST" ] || [ -z "$USERNAME" ]; then
+          echo "Missing required secrets. Please set EC2_SSH_KEY, EC2_HOST, and EC2_USERNAME in repository secrets."
+          exit 1
+        fi
+        
         # Create SSH key file
         echo "$PRIVATE_KEY" > deploy_key.pem
         chmod 600 deploy_key.pem
