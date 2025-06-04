@@ -4,4 +4,4 @@ python-dotenv==1.0.1
 pyotp==2.9.0
 gunicorn==21.2.0
 fyers-apiv3==3.1.7
-urllib3==2.2.1 
+urllib3>=1.25.4,<1.27 
