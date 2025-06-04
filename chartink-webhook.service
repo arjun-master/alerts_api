@@ -1,0 +1,14 @@
+[Unit]
+Description=Chartink Telegram Webhook Service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chartink-telegram-webhook
+Environment="PATH=/home/ubuntu/chartink-telegram-webhook/venv/bin"
+ExecStart=/home/ubuntu/chartink-telegram-webhook/venv/bin/gunicorn -w 2 -b 0.0.0.0:8080 --timeout 30 --keep-alive 5 --max-requests 1000 --max-requests-jitter 50 app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target 

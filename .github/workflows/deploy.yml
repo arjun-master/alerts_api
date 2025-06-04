@@ -1,0 +1,64 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.8'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Deploy to EC2
+      env:
+        PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        HOST: ${{ secrets.EC2_HOST }}
+        USERNAME: ${{ secrets.EC2_USERNAME }}
+      run: |
+        # Create SSH key file
+        echo "$PRIVATE_KEY" > deploy_key.pem
+        chmod 600 deploy_key.pem
+        
+        # Create deployment script
+        cat > deploy.sh << 'EOF'
+        #!/bin/bash
+        cd /home/$USERNAME/chartink-telegram-webhook
+        git pull origin main
+        python3 -m pip install --upgrade pip
+        python3 -m pip install -r requirements.txt
+        
+        # Create logs directory if it doesn't exist
+        mkdir -p logs
+        
+        # Restart the service
+        sudo systemctl restart chartink-webhook
+        EOF
+        
+        # Copy deployment script to EC2
+        scp -i deploy_key.pem -o StrictHostKeyChecking=no deploy.sh $USERNAME@$HOST:~/deploy.sh
+        
+        # Execute deployment script
+        ssh -i deploy_key.pem -o StrictHostKeyChecking=no $USERNAME@$HOST "chmod +x ~/deploy.sh && ~/deploy.sh"
+        
+        # Cleanup
+        rm deploy_key.pem 
